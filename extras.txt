@@ -1,0 +1,16 @@
+# class users(SQLModel, table=True):
+#     id: Optional[int] = Field(default=None, primary_key=True)
+#     username: str = Field(index=True)
+#     email: str = Field(unique=True, index=True)
+#     password_hash: str
+
+# class groups(SQLModel, table=True):
+#     id: Optional[int] = Field(default=None, primary_key=True)
+#     name: str = Field(index=True)
+#     description: str
+
+# class groupMembership(SQLModel, table=True):
+#     id: Optional[int] = Field(default=None, primary_key=True)
+#     user_id: int = Field(foreign_key="users.id") # Fixed
+#     group_id: int = Field(foreign_key="groups.id") # Fixed
+#     role: str = Field(description="enum: viewer / editor / owner")
