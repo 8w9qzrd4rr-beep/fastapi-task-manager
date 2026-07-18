@@ -1,7 +1,8 @@
 import datetime
+import hashlib
 from enum import IntEnum
-from random import randint
 from fastapi import FastAPI, HTTPException, Response, Depends
+# from fastapi.security import OAuth2PasswordBearer
 from typing import Any, Optional
 from sqlmodel import Field, SQLModel, Session, create_engine, select
 from contextlib import asynccontextmanager
@@ -11,7 +12,7 @@ sqlite_url = f"sqlite:///{sqlite_file_name}"
 connect_args = {"check_same_thread": False}
 engine = create_engine(sqlite_url, connect_args=connect_args)
 
-#################---CREATING CLASSES---######################
+#################---CLASSES---######################
 class TaskStatus(IntEnum):
     open = 0
     in_progress = 1
@@ -19,8 +20,8 @@ class TaskStatus(IntEnum):
 class Task(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     title: str = Field(index=True)
-    user_id: Optional[int] = Field(default=None)
-    group_id: Optional[int] = Field(default=None)
+    user_id: Optional[int] = Field(default=None, foreign_key="user.id")
+    group_id: Optional[int] = Field(default=None, foreign_key="group.id")
     status: TaskStatus = Field(default=TaskStatus.open)
     content: str
     level_of_importance: int
@@ -28,6 +29,20 @@ class Task(SQLModel, table=True):
     created_at: datetime.datetime = Field(
         default_factory=lambda: datetime.datetime.now(datetime.timezone.utc)
     )
+class User(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    username: str = Field(index=True)
+    email: str = Field(unique=True, index=True)
+    password_hash: str
+class Group(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str = Field(index=True)
+    description: str
+class GroupMembership(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id") # Fixed
+    group_id: int = Field(foreign_key="group.id") # Fixed
+    role: str = Field(description="enum: viewer / editor / owner")
 
 def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
@@ -42,9 +57,17 @@ async def lifespan(app: FastAPI):
     yield
 app = FastAPI(lifespan=lifespan)
 
+def hash_password(raw_password: str) -> str:
+    # NOTE: placeholder hashing only - no real auth/security required for now
+    return hashlib.sha256(raw_password.encode("utf-8")).hexdigest()
+
 @app.get("/")               ###ROOT
 async def root():
     return {"welcome"}
+
+#######################################################################
+##############################---TASKS---##############################
+#######################################################################
 
 @app.get("/api/v1/tasks") ###READ ALL TASKS
 async def read_tasks(session: Session = Depends(get_session)):
@@ -60,11 +83,30 @@ async def read_task(id: int, session: Session = Depends(get_session)):
 
 @app.post("/api/v1/tasks")
 async def add_task(body: dict[str, Any], session: Session = Depends(get_session)):
+    user_id = body.get("user_id")
+    group_id = body.get("group_id")
+
+    # A task belongs to either a single user or a group -- never both, never neither.
+    if user_id is None and group_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Task must have either a user_id or a group_id",
+        )
+    if user_id is not None and group_id is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Task cannot have both a user_id and a group_id -- choose one",
+        )
+    if user_id is not None and not session.get(User, user_id):
+        raise HTTPException(status_code=404, detail="User not found")
+    if group_id is not None and not session.get(Group, group_id):
+        raise HTTPException(status_code=404, detail="Group not found")
+
     new_task = Task(
         title=body.get("title"),
-        user_id=randint(100, 1000),
-        group_id=None,
-        status=0,
+        user_id=user_id,
+        group_id=group_id,
+        status=body.get("status", 0),
         content=body.get("content"),
         level_of_importance=body.get("level"),
         date_due=datetime.datetime.strptime(body.get("due_date"), "%Y-%m-%d %H:%M:%S"),
@@ -86,6 +128,26 @@ async def update_task(id: int, body: dict[str, Any], session: Session = Depends(
     recieved.content = body.get("content", recieved.content)
     recieved.level_of_importance = body.get("level", recieved.level_of_importance)
 
+    if "user_id" in body:
+        if body["user_id"] is not None and not session.get(User, body["user_id"]):
+            raise HTTPException(status_code=404, detail="User not found")
+        recieved.user_id = body["user_id"]
+    if "group_id" in body:
+        if body["group_id"] is not None and not session.get(Group, body["group_id"]):
+            raise HTTPException(status_code=404, detail="Group not found")
+        recieved.group_id = body["group_id"]
+
+    if recieved.user_id is None and recieved.group_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Task must have either a user_id or a group_id",
+        )
+    if recieved.user_id is not None and recieved.group_id is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Task cannot have both a user_id and a group_id -- choose one",
+        )
+
     if body.get("due_date"):
         recieved.date_due = datetime.datetime.strptime(body["due_date"], "%Y-%m-%d %H:%M:%S")
 
@@ -93,42 +155,183 @@ async def update_task(id: int, body: dict[str, Any], session: Session = Depends(
     session.refresh(recieved)
     return recieved
 
-@app.delete("/api/vi/tasks/{id}")
-async def delete_task(id: int, session:Session = Depends(get_session)):
+@app.delete("/api/v1/tasks/{id}")
+async def delete_task(id: int, session: Session = Depends(get_session)):
     recieved = session.get(Task, id)
     if not recieved:
         raise HTTPException(status_code=404, detail="Task not found")
 
     session.delete(recieved)
     session.commit()
+    return {"deleted": id}
+
+#######################################################################
+##############################---USERS---###############################
 #######################################################################
 
+@app.get("/api/v1/users") ###READ ALL USERS
+async def read_users(session: Session = Depends(get_session)):
+    users = session.exec(select(User)).all()
+    return users
 
-# @app.get("/api/v1/users") #all users lists no filter
-# async def read_tasks():
-#     return {"users": users_data}
+@app.get("/api/v1/users/{id}") ###READ BY ID
+async def read_user(id: int, session: Session = Depends(get_session)):
+    user_search = session.get(User, id)
+    if not user_search:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user_search
 
-# @app.get("/api/v1/users/{id}") #user by id
-# async def get_user(id: int):
-#     for user in users_data:
-#         if user.get("id") == id:
-#             return {"users_data": user}
-#     raise HTTPException(status_code=404)
+@app.post("/api/v1/users")
+async def add_user(body: dict[str, Any], session: Session = Depends(get_session)):
+    raw_password = body.get("password")
+    if not raw_password:
+        raise HTTPException(status_code=400, detail="password is required")
 
-# def get_password_hash(password: str) -> str:
-#     password_bytes = password.encode('utf-8')
-#     salt = bcrypt.gensalt()
-#     hashed_bytes = bcrypt.hashpw(password_bytes, salt)
-#     return hashed_bytes.decode('utf-8')
+    new_user = User(
+        username=body.get("username"),
+        email=body.get("email"),
+        password_hash=hash_password(raw_password),
+    )
+    session.add(new_user)
+    session.commit()
+    session.refresh(new_user)
+    return {"users": new_user}
 
-# @app.post("/api/v1/users")
-# async def add_user(body: dict[str, Any]):
-#     raw_password = body.get("password")
-#     new : Any = {
-#         "id": randint(100, 1000),
-#         "username": body.get("username"),
-#         "email": body.get("email"),
-#         "password_hash": get_password_hash(raw_password)
-#     }
-#     users_data.append(new)
-#     return {"users": new}
+@app.put("/api/v1/users/{id}")
+async def update_user(id: int, body: dict[str, Any], session: Session = Depends(get_session)):
+    recieved = session.get(User, id)
+    if not recieved:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    recieved.username = body.get("username", recieved.username)
+    recieved.email = body.get("email", recieved.email)
+
+    if body.get("password"):
+        recieved.password_hash = hash_password(body["password"])
+
+    session.commit()
+    session.refresh(recieved)
+    return recieved
+
+@app.delete("/api/v1/users/{id}")
+async def delete_user(id: int, session: Session = Depends(get_session)):
+    recieved = session.get(User, id)
+    if not recieved:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    session.delete(recieved)
+    session.commit()
+    return {"deleted": id}
+
+#######################################################################
+##############################---GROUPS---###############################
+#######################################################################
+
+@app.get("/api/v1/groups") ###READ ALL GROUPS
+async def read_groups(session: Session = Depends(get_session)):
+    groups = session.exec(select(Group)).all()
+    return groups
+
+@app.get("/api/v1/groups/{id}") ###READ BY ID
+async def read_group(id: int, session: Session = Depends(get_session)):
+    group_search = session.get(Group, id)
+    if not group_search:
+        raise HTTPException(status_code=404, detail="Group not found")
+    return group_search
+
+@app.post("/api/v1/groups")
+async def add_group(body: dict[str, Any], session: Session = Depends(get_session)):
+    new_group = Group(
+        name=body.get("name"),
+        description=body.get("description"),
+    )
+    session.add(new_group)
+    session.commit()
+    session.refresh(new_group)
+    return {"groups": new_group}
+
+@app.put("/api/v1/groups/{id}")
+async def update_group(id: int, body: dict[str, Any], session: Session = Depends(get_session)):
+    recieved = session.get(Group, id)
+    if not recieved:
+        raise HTTPException(status_code=404, detail="Group not found")
+
+    recieved.name = body.get("name", recieved.name)
+    recieved.description = body.get("description", recieved.description)
+
+    session.commit()
+    session.refresh(recieved)
+    return recieved
+
+@app.delete("/api/v1/groups/{id}")
+async def delete_group(id: int, session: Session = Depends(get_session)):
+    recieved = session.get(Group, id)
+    if not recieved:
+        raise HTTPException(status_code=404, detail="Group not found")
+
+    session.delete(recieved)
+    session.commit()
+    return {"deleted": id}
+
+#######################################################################
+##########################---GROUP MEMBERSHIPS---#########################
+#######################################################################
+
+@app.get("/api/v1/group-memberships") ###READ ALL MEMBERSHIPS
+async def read_group_memberships(session: Session = Depends(get_session)):
+    memberships = session.exec(select(GroupMembership)).all()
+    return memberships
+
+@app.get("/api/v1/group-memberships/{id}") ###READ BY ID
+async def read_group_membership(id: int, session: Session = Depends(get_session)):
+    membership_search = session.get(GroupMembership, id)
+    if not membership_search:
+        raise HTTPException(status_code=404, detail="GroupMembership not found")
+    return membership_search
+
+@app.post("/api/v1/group-memberships")
+async def add_group_membership(body: dict[str, Any], session: Session = Depends(get_session)):
+    user_id = body.get("user_id")
+    group_id = body.get("group_id")
+
+    if user_id is None or group_id is None:
+        raise HTTPException(status_code=400, detail="user_id and group_id are required")
+
+    if not session.get(User, user_id):
+        raise HTTPException(status_code=404, detail="User not found")
+    if not session.get(Group, group_id):
+        raise HTTPException(status_code=404, detail="Group not found")
+
+    new_membership = GroupMembership(
+        user_id=user_id,
+        group_id=group_id,
+        role=body.get("role", "viewer"),
+    )
+    session.add(new_membership)
+    session.commit()
+    session.refresh(new_membership)
+    return {"group_memberships": new_membership}
+
+@app.put("/api/v1/group-memberships/{id}")
+async def update_group_membership(id: int, body: dict[str, Any], session: Session = Depends(get_session)):
+    recieved = session.get(GroupMembership, id)
+    if not recieved:
+        raise HTTPException(status_code=404, detail="GroupMembership not found")
+
+    recieved.user_id = body.get("user_id", recieved.user_id)
+    recieved.group_id = body.get("group_id", recieved.group_id)
+    recieved.role = body.get("role", recieved.role)
+
+    session.commit()
+    session.refresh(recieved)
+    return recieved
+
+@app.delete("/api/v1/group-memberships/{id}")
+async def delete_group_membership(id: int, session: Session = Depends(get_session)):
+    recieved = session.get(GroupMembership, id)
+    if not recieved:
+        raise HTTPException(status_code=404, detail="GroupMembership not found")
+
+    session.delete(recieved)
+    session.commit()
+    return {"deleted": id}
