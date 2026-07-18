@@ -55,7 +55,7 @@ async def read_tasks(session: Session = Depends(get_session)):
 async def read_task(id: int, session: Session = Depends(get_session)):
     task_search = session.get(Task, id)
     if not task_search:
-        raise HTTPException(status_code=404, detail="Hero not found")
+        raise HTTPException(status_code=404, detail="Task not found")
     return task_search
 
 @app.post("/api/v1/tasks")
@@ -68,39 +68,39 @@ async def add_task(body: dict[str, Any], session: Session = Depends(get_session)
         content=body.get("content"),
         level_of_importance=body.get("level"),
         date_due=datetime.datetime.strptime(body.get("due_date"), "%Y-%m-%d %H:%M:%S"),
-        created_at=datetime.datetime.now(datetime.timezone.utc),
+        created_at=datetime.datetime.now(datetime.timezone.utc)
     )
     session.add(new_task)
     session.commit()
     session.refresh(new_task)
     return {"tasks": new_task}
 
-# @app.put("/api/v1/tasks/{id}")
-# async def update_task(id: int, body: dict[str, Any]):
-#     for index, task in enumerate(tasks_data):
-#         if task.get("id") == id:
-#             updated : Any = {
-#                 "id": task.get("id"),
-#                 "title": body.get("title"),
-#                 "user_id": task.get("user_id"),
-#                 "group_id": "null",
-#                 "status": body.get("status"),
-#                 "Content": body.get("content"),
-#                 "level": body.get("level")
-#             }
-#             tasks_data[index] = updated
-#             return {"tasks": updated}
-#     raise HTTPException(status_code=404, detail="Task not found")
+@app.put("/api/v1/tasks/{id}")
+async def update_task(id: int, body: dict[str, Any], session: Session = Depends(get_session)):
+    recieved = session.get(Task, id)
+    if not recieved:
+        raise HTTPException(status_code=404, detail="Task not found")
 
-# @app.delete("/api/vi/tasks/{id}")
-# async def delete_task(id: int):
-#     for index, task in enumerate(tasks_data):
-#         if task.get("id") == id:
-#             tasks_data.pop(index)
-#             return Response(status_code =204)
-#     raise HTTPException(status_code=404)
+    recieved.title = body.get("title", recieved.title)
+    recieved.status = body.get("status", recieved.status)
+    recieved.content = body.get("content", recieved.content)
+    recieved.level_of_importance = body.get("level", recieved.level_of_importance)
 
+    if body.get("due_date"):
+        recieved.date_due = datetime.datetime.strptime(body["due_date"], "%Y-%m-%d %H:%M:%S")
 
+    session.commit()
+    session.refresh(recieved)
+    return recieved
+
+@app.delete("/api/vi/tasks/{id}")
+async def delete_task(id: int, session:Session = Depends(get_session)):
+    recieved = session.get(Task, id)
+    if not recieved:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    session.delete(recieved)
+    session.commit()
 #######################################################################
 
 
