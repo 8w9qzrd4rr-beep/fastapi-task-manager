@@ -2,7 +2,10 @@ import datetime
 import hashlib
 from enum import IntEnum
 from fastapi import FastAPI, HTTPException, Response, Depends
-# from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
+from datetime import timedelta
+from fastapi.security import OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordBearer
 from typing import Any, Optional
 from sqlmodel import Field, SQLModel, Session, create_engine, select
 from contextlib import asynccontextmanager
@@ -12,6 +15,15 @@ sqlite_url = f"sqlite:///{sqlite_file_name}"
 connect_args = {"check_same_thread": False}
 engine = create_engine(sqlite_url, connect_args=connect_args)
 
+SECRET_KEY = "dev-secret-change-me"
+ALGORITHM = "HS256"
+
+def create_access_token(user_id: int) -> str:
+    expire = datetime.datetime.now(datetime.timezone.utc) + timedelta(minutes=60)
+    payload = {"sub": str(user_id), "exp": expire}
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 #################---CLASSES---######################
 class TaskStatus(IntEnum):
     open = 0
@@ -65,6 +77,22 @@ def hash_password(raw_password: str) -> str:
 async def root():
     return {"welcome"}
 
+
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    session: Session = Depends(get_session),
+) -> User:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("sub")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    user = session.get(User, int(user_id))
+    if not user:
+        raise HTTPException(status_code=401, detail="User no longer exists")
+    return user
+
 #######################################################################
 ##############################---TASKS---##############################
 #######################################################################
@@ -74,12 +102,36 @@ async def read_tasks(session: Session = Depends(get_session)):
     tasks = session.exec(select(Task)).all()
     return tasks
 
-@app.get("/api/v1/tasks/{id}") ###READ BY ID
-async def read_task(id: int, session: Session = Depends(get_session)):
+@app.get("/api/v1/tasks/{id}")
+async def read_task(
+    id: int,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
     task_search = session.get(Task, id)
     if not task_search:
         raise HTTPException(status_code=404, detail="Task not found")
-    return task_search
+
+    # Case 1: task belongs directly to a user
+    if task_search.user_id is not None:
+        if task_search.user_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Not authorized to view this task")
+        return task_search
+
+    # Case 2: task belongs to a group -- current_user must be a member
+    if task_search.group_id is not None:
+        membership = session.exec(
+            select(GroupMembership).where(
+                GroupMembership.group_id == task_search.group_id,
+                GroupMembership.user_id == current_user.id,
+            )
+        ).first()
+        if not membership:
+            raise HTTPException(status_code=403, detail="Not authorized to view this task")
+        return task_search
+
+    # Shouldn't happen given add_task's validation, but guard anyway
+    raise HTTPException(status_code=403, detail="Not authorized to view this task")
 
 @app.post("/api/v1/tasks")
 async def add_task(body: dict[str, Any], session: Session = Depends(get_session)):
@@ -335,3 +387,12 @@ async def delete_group_membership(id: int, session: Session = Depends(get_sessio
     session.delete(recieved)
     session.commit()
     return {"deleted": id}
+
+####### AUTHENTICATION ########
+@app.post("/token")
+async def login(form_data: OAuth2PasswordRequestForm = Depends(), session: Session = Depends(get_session)):
+    user = session.exec(select(User).where(User.username == form_data.username)).first()
+    if not user or user.password_hash != hash_password(form_data.password):
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    token = create_access_token(user.id)
+    return {"access_token": token, "token_type": "bearer"}
