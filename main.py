@@ -1,3 +1,6 @@
+import os
+from dotenv import load_dotenv
+load_dotenv()
 import datetime
 import hashlib
 from enum import IntEnum
@@ -15,7 +18,7 @@ sqlite_url = f"sqlite:///{sqlite_file_name}"
 connect_args = {"check_same_thread": False}
 engine = create_engine(sqlite_url, connect_args=connect_args)
 
-SECRET_KEY = "dev-secret-change-me"
+SECRET_KEY = os.environ["SECRET_KEY"]
 ALGORITHM = "HS256"
 
 def create_access_token(user_id: int) -> str:
